@@ -145,6 +145,35 @@ def flow_stats(flow: np.ndarray, motion_threshold: float = 1.0) -> dict:
     }
 
 
+def global_shift(
+    prev: np.ndarray, next_frame: np.ndarray, max_side: int = 640
+) -> dict:
+    """Dominant whole-frame translation via phase correlation.
+
+    Independent of the dense estimators: it is one number for the whole frame,
+    it cannot be fooled by texture noise the way a per-pixel field can, and it
+    does not saturate at large displacements the way Farneback does. Cheap
+    (a couple of ms), so it is worth keeping next to the dense flow.
+    """
+    a, b = _to_uint8(prev), _to_uint8(next_frame)
+    h, w = a.shape[:2]
+    k = min(1.0, max_side / float(max(h, w)))
+    if k < 1.0:
+        a = cv2.resize(a, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+        b = cv2.resize(b, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    a = cv2.GaussianBlur(a, (5, 5), 0).astype(np.float32)
+    b = cv2.GaussianBlur(b, (5, 5), 0).astype(np.float32)
+    window = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
+    (dx, dy), response = cv2.phaseCorrelate(a, b, window)
+    dx, dy = dx / k, dy / k  # back to original pixels
+    return {
+        "shift_x": float(dx),
+        "shift_y": float(dy),
+        "shift_magnitude": float(np.hypot(dx, dy)),
+        "shift_response": float(response),
+    }
+
+
 def save_flow(path: str | Path, flow: np.ndarray) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -20,6 +20,7 @@ SERIES = (
     ("mean_magnitude", "mean |v|, px", (0, 200, 0)),
     ("moving_pixels_pct", "moving pixels, %", (200, 120, 0)),
     ("direction_coherence", "direction coherence", (0, 100, 220)),
+    ("shift_magnitude", "global shift, px", (180, 0, 0)),
     ("mean_dy", "mean dy, px (down +)", (200, 0, 160)),
 )
 
@@ -30,6 +31,7 @@ FEATURES = (
     ("direction_coherence", 1.0),  # motion lines up in one direction
     ("verticality", 1.0),  # vertical component dominates
     ("moving_pixels_pct", 0.5),  # more of the frame is moving
+    ("shift_magnitude", 1.5),  # whole-frame displacement jumps
 )
 
 
@@ -93,7 +95,9 @@ def analyse(
     """Enrich records with z-scores and a combined event score."""
     if not records:
         return []
-    values = {name: np.array([r[name] for r in records]) for name, _, _ in SERIES}
+    values = {
+        name: np.array([r.get(name, 0.0) for r in records]) for name, _, _ in SERIES
+    }
     vert = np.array([verticality(r) for r in records])
     zs = {name: robust_z(v, window) for name, v in values.items()}
     zs["verticality"] = robust_z(vert, window)
@@ -112,6 +116,7 @@ def analyse(
         enriched.update(
             {
                 "verticality": float(vert[i]),
+                "z_shift_magnitude": float(zs["shift_magnitude"][i]),
                 "z_mean_magnitude": float(zs["mean_magnitude"][i]),
                 "z_moving_pixels_pct": float(zs["moving_pixels_pct"][i]),
                 "z_direction_coherence": float(zs["direction_coherence"][i]),
@@ -135,8 +140,9 @@ def write_csv(path: str | Path, records: list[dict]) -> Path:
     fields = [
         "pair", "from", "to", "mean_magnitude", "moving_pixels_pct",
         "direction_coherence", "mean_dx", "mean_dy", "verticality",
+        "shift_magnitude", "shift_x", "shift_y", "shift_response",
         "z_mean_magnitude", "z_moving_pixels_pct", "z_direction_coherence",
-        "z_verticality", "event_score", "is_event",
+        "z_verticality", "z_shift_magnitude", "event_score", "is_event", "static",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")

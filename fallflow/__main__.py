@@ -20,7 +20,15 @@ import cv2
 import numpy as np
 
 from . import __version__
-from .flow import FlowConfig, compute_flow, flow_stats, load_flow, polar, save_flow
+from .flow import (
+    FlowConfig,
+    compute_flow,
+    flow_stats,
+    global_shift,
+    load_flow,
+    polar,
+    save_flow,
+)
 from .frames import discover_frames, load_gray
 from .visualize import draw_arrows, flow_to_bgr, montage
 
@@ -29,6 +37,10 @@ DEFAULT_OUT = "outputs"
 
 STAT_FIELDS = (
     "mean_magnitude",
+    "shift_magnitude",
+    "shift_x",
+    "shift_y",
+    "shift_response",
     "median_magnitude",
     "p95_magnitude",
     "max_magnitude",
@@ -59,6 +71,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="downscale factor before matching (flow is rescaled back)",
+    )
+    p.add_argument(
+        "--levels",
+        type=int,
+        default=3,
+        help="Farneback pyramid levels (more = larger displacements)",
+    )
+    p.add_argument(
+        "--winsize",
+        type=int,
+        default=15,
+        help="Farneback averaging window (odd, larger = smoother/robuster)",
+    )
+    p.add_argument(
+        "--iterations", type=int, default=3, help="Farneback iterations per level"
     )
     p.add_argument(
         "--blur",
@@ -173,7 +200,18 @@ def main(argv: list[str] | None = None) -> int:
 
     warn_duplicates(paths, log)
 
-    cfg = FlowConfig(method=args.method, scale=args.scale, blur=args.blur)
+    cfg = FlowConfig(
+        method=args.method,
+        scale=args.scale,
+        blur=args.blur,
+        levels=args.levels,
+        winsize=args.winsize | 1,
+        iterations=args.iterations,
+    )
+    if args.method == "farneback":
+        log(f"params      : levels={cfg.levels} winsize={cfg.winsize} iterations={cfg.iterations}")
+    if args.blur:
+        log(f"blur        : {args.blur | 1}x{args.blur | 1}")
     stats_dir = out_dir / "stats"
     rows: list[dict] = []
     started = time.perf_counter()
@@ -209,7 +247,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 cv2.imwrite(str(viz_dir / f"{name}_arrows.png"), overlay)
 
-        record = {"pair": name, "from": paths[i - 1].name, "to": paths[j - 1].name, **stats}
+        record = {
+            "pair": name,
+            "from": paths[i - 1].name,
+            "to": paths[j - 1].name,
+            **stats,
+            **global_shift(prev, curr),
+        }
         rows.append(record)
         stats_dir.mkdir(parents=True, exist_ok=True)
         stats_path.write_text(json.dumps(record, indent=2))
@@ -234,16 +278,32 @@ def main(argv: list[str] | None = None) -> int:
         records[rec["pair"]] = rec
     for i, j in pairs:
         name = pair_name(i, j)
-        if name in records:
+        existing = records.get(name)
+        if existing and "shift_magnitude" in existing:
             continue
         cached = flow_dir / f"{name}.npy"
+        record = None
         if cached.exists():  # backfill stats from an already saved field
-            records[name] = {
+            record = {
                 "pair": name,
                 "from": paths[i - 1].name,
                 "to": paths[j - 1].name,
                 **flow_stats(load_flow(cached)),
             }
+        if existing:
+            # stats predate global_shift — the shift needs only the frames
+            record = dict(existing)
+        if record is not None:
+            if "shift_magnitude" not in record:
+                record.update(
+                    global_shift(
+                        load_gray(paths[i - 1], cfg.scale),
+                        load_gray(paths[j - 1], cfg.scale),
+                    )
+                )
+            records[name] = record
+            stats_dir.mkdir(parents=True, exist_ok=True)
+            (stats_dir / f"{name}.json").write_text(json.dumps(record, indent=2))
     rows = [records[k] for k in sorted(records)]
 
     if rows:
