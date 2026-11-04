@@ -35,6 +35,35 @@ def detect(gray: np.ndarray, max_corners: int = 300) -> np.ndarray | None:
     )
 
 
+def track_corners(
+    prev: np.ndarray, curr: np.ndarray, max_corners: int = 300
+) -> tuple[np.ndarray, np.ndarray]:
+    """Track corners, returning matched (source, destination) point pairs.
+
+    Shared by the tracking summary and by the global motion fit.
+    """
+    corners = detect(prev, max_corners)
+    empty = np.zeros((0, 2), np.float64)
+    if corners is None or len(corners) < 8:
+        return empty, empty
+    points, status, _ = cv2.calcOpticalFlowPyrLK(
+        _to_uint8(prev),
+        _to_uint8(curr),
+        corners,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    status = status.reshape(-1).astype(bool)
+    if status.sum() < 8:
+        return empty, empty
+    return (
+        corners[status].reshape(-1, 2).astype(np.float64),
+        points[status].reshape(-1, 2).astype(np.float64),
+    )
+
+
 def track_pair(
     prev: np.ndarray,
     curr: np.ndarray,
