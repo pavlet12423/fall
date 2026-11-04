@@ -19,6 +19,35 @@ python3 -m venv .venv
 
 Нужен только Python и две библиотеки. Всё считается локально, в интернет ничего не уходит.
 
+### Windows, по шагам (cmd)
+
+```bat
+:: 0. выйти из REPL питона, если вы в нём (>>> )
+exit()
+
+:: 1. зайти в папку проекта (пробелы в пути — поэтому кавычки)
+cd "C:\python project\fall"
+
+:: 2. создать виртуальное окружение .venv в этой папке
+python -m venv .venv
+
+:: 3. активировать его — слева появится (.venv)
+.venv\Scripts\activate
+
+:: 4. поставить библиотеки (разово, ~60 МБ)
+python -m pip install --upgrade pip
+pip install numpy opencv-python-headless
+
+:: 5. проверить, что всё встало
+python -c "import cv2, numpy; print(cv2.__version__, numpy.__version__)"
+
+:: 6. запустить пипетку
+python probe.py --frames data/frames --fps 25
+
+:: остановить — Ctrl+C; выйти из окружения — deactivate
+```
+Открыть в браузере `http://127.0.0.1:8765`.
+
 **1. Python.** Если его нет — https://www.python.org/downloads/ , версия 3.10 или новее.
 На Windows в установщике обязательно поставьте галочку **«Add python.exe to PATH»**.
 Проверка (в терминале / PowerShell / cmd):
