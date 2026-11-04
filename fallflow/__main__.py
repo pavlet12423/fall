@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from . import __version__
-from .flow import FlowConfig, compute_flow, flow_stats, polar, save_flow
+from .flow import FlowConfig, compute_flow, flow_stats, load_flow, polar, save_flow
 from .frames import discover_frames, load_gray
 from .visualize import draw_arrows, flow_to_bgr, montage
 
@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="downscale factor before matching (flow is rescaled back)",
+    )
+    p.add_argument(
+        "--blur",
+        type=int,
+        default=0,
+        help="gaussian blur kernel before matching (odd, 0 = off)",
     )
     p.add_argument(
         "--stride", type=int, default=1, help="compare frame i with i+stride"
@@ -167,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
 
     warn_duplicates(paths, log)
 
-    cfg = FlowConfig(method=args.method, scale=args.scale)
+    cfg = FlowConfig(method=args.method, scale=args.scale, blur=args.blur)
+    stats_dir = out_dir / "stats"
     rows: list[dict] = []
     started = time.perf_counter()
     skipped = 0
@@ -176,7 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         name = pair_name(i, j)
         flow_path = flow_dir / f"{name}.npy"
         viz_path = viz_dir / f"{name}.png"
-        done = (args.no_flow or flow_path.exists()) and (args.no_viz or viz_path.exists())
+        stats_path = stats_dir / f"{name}.json"
+        done = (
+            (args.no_flow or flow_path.exists())
+            and (args.no_viz or viz_path.exists())
+            and stats_path.exists()  # stats are needed for the report
+        )
         if done and not args.overwrite:
             skipped += 1
             continue
@@ -197,7 +209,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 cv2.imwrite(str(viz_dir / f"{name}_arrows.png"), overlay)
 
-        rows.append({"pair": name, "from": paths[i - 1].name, "to": paths[j - 1].name, **stats})
+        record = {"pair": name, "from": paths[i - 1].name, "to": paths[j - 1].name, **stats}
+        rows.append(record)
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(json.dumps(record, indent=2))
         log(
             f"  [{n}/{len(pairs)}] {name}: mean |v| = {stats['mean_magnitude']:6.3f} px, "
             f"moving = {stats['moving_pixels_pct']:5.1f}%"
@@ -205,6 +220,31 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.perf_counter() - started
     log(f"done in {elapsed:.1f}s ({len(rows)} computed, {skipped} already on disk)")
+
+    # the report always describes the whole sequence, not just the new pairs:
+    # stats are read back from the sidecars (or recomputed from a saved .npy)
+    records: dict[str, dict] = {}
+    for sidecar in sorted(stats_dir.glob("flow_*.json")) if stats_dir.exists() else []:
+        try:
+            rec = json.loads(sidecar.read_text())
+        except json.JSONDecodeError:
+            continue
+        records[rec["pair"]] = rec
+    for rec in rows:  # freshly computed values win
+        records[rec["pair"]] = rec
+    for i, j in pairs:
+        name = pair_name(i, j)
+        if name in records:
+            continue
+        cached = flow_dir / f"{name}.npy"
+        if cached.exists():  # backfill stats from an already saved field
+            records[name] = {
+                "pair": name,
+                "from": paths[i - 1].name,
+                "to": paths[j - 1].name,
+                **flow_stats(load_flow(cached)),
+            }
+    rows = [records[k] for k in sorted(records)]
 
     if rows:
         report_csv = out_dir / "report.csv"

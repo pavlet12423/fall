@@ -21,6 +21,7 @@ class FlowConfig:
 
     method: str = "farneback"
     scale: float = 1.0
+    blur: int = 0  # gaussian kernel size before matching (0 = off, use odd numbers)
 
     # Farneback
     pyr_scale: float = 0.5
@@ -71,6 +72,10 @@ def compute_flow(
     # both estimators need 8-bit single-channel input
     prev_u8 = _to_uint8(prev)
     next_u8 = _to_uint8(next_frame)
+    if cfg.blur:
+        k = cfg.blur | 1  # force odd
+        prev_u8 = cv2.GaussianBlur(prev_u8, (k, k), 0)
+        next_u8 = cv2.GaussianBlur(next_u8, (k, k), 0)
     if prev_u8.shape != next_u8.shape:
         raise ValueError(f"frame size mismatch: {prev_u8.shape} vs {next_u8.shape}")
 
