@@ -6,7 +6,7 @@ venv/
 *.egg-info/
 
 # Pipeline outputs (flow fields, visualisations, reports) — regenerated on demand
-outputs/
+outputs*/
 
 # Editors / OS
 .idea/

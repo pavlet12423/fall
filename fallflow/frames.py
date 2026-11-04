@@ -75,3 +75,21 @@ def frame_size(directory: str | Path) -> tuple[int, int] | None:
             height, width = image.shape[:2]
             return width, height
     return None
+
+
+def frame_quality(path: str | Path) -> dict:
+    """Cheap per-frame descriptors: exposure, contrast and sharpness.
+
+    Sharpness is the variance of the Laplacian — it collapses under motion
+    blur or defocus, and every optical-flow estimator degrades with it, so it
+    doubles as a confidence signal for the flow of that frame.
+    """
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise OSError(f"cannot read image: {path}")
+    blurred = cv2.GaussianBlur(image, (3, 3), 0)
+    return {
+        "brightness": float(image.mean()),
+        "contrast": float(image.std()),
+        "sharpness": float(cv2.Laplacian(blurred, cv2.CV_64F).var()),
+    }

@@ -29,7 +29,7 @@ from .flow import (
     polar,
     save_flow,
 )
-from .frames import discover_frames, load_gray
+from .frames import discover_frames, frame_quality, load_gray
 from .visualize import draw_arrows, flow_to_bgr, montage
 
 DEFAULT_FRAMES = "data/frames"
@@ -41,6 +41,7 @@ STAT_FIELDS = (
     "shift_x",
     "shift_y",
     "shift_response",
+    "t_from", "t_to", "dt_s", "speed_px_s", "shift_speed_px_s",
     "median_magnitude",
     "p95_magnitude",
     "max_magnitude",
@@ -94,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="gaussian blur kernel before matching (odd, 0 = off)",
     )
     p.add_argument(
+        "--fps",
+        type=float,
+        default=0.0,
+        help="source frame rate (0 = unknown): adds seconds and px/s columns",
+    )
+    p.add_argument(
         "--stride", type=int, default=1, help="compare frame i with i+stride"
     )
     p.add_argument("--limit", type=int, default=0, help="max number of pairs (0 = all)")
@@ -118,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="also build a contact sheet of all visualisations",
     )
     p.add_argument("--montage-cols", type=int, default=5, help="columns in the montage")
+    p.add_argument(
+        "--no-frame-quality",
+        action="store_true",
+        help="skip the per-frame exposure/contrast/sharpness dump",
+    )
     p.add_argument("--no-flow", action="store_true", help="do not save .npy fields")
     p.add_argument("--no-viz", action="store_true", help="do not save visualisations")
     p.add_argument(
@@ -130,6 +142,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 PERCENTILES = {"p99": 99, "p95": 95}
+
+
+def with_timing(record: dict, i: int, j: int, fps: float) -> dict:
+    """Add seconds and px/s columns when the frame rate is known."""
+    if fps and fps > 0:
+        dt = (j - i) / fps
+        record["dt_s"] = dt
+        record["t_from"] = (i - 1) / fps
+        record["t_to"] = (j - 1) / fps
+        record["speed_px_s"] = record["mean_magnitude"] / dt
+        record["shift_speed_px_s"] = record.get("shift_magnitude", 0.0) / dt
+    return record
 
 
 def _colour_scale(flow: np.ndarray, args) -> float | None:
@@ -192,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     log(f"frames      : {len(paths)} in {frames_dir}")
     log(f"pairs       : {len(pairs)} (stride {stride})")
     log(f"method      : {args.method} @ scale {args.scale}")
+    if args.fps:
+        log(f"timing      : {args.fps:g} fps -> {len(paths) / args.fps:.2f}s of video")
 
     if args.dry_run:
         for i, j in pairs:
@@ -254,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             **stats,
             **global_shift(prev, curr),
         }
-        rows.append(record)
+        rows.append(with_timing(record, i, j, args.fps))
         stats_dir.mkdir(parents=True, exist_ok=True)
         stats_path.write_text(json.dumps(record, indent=2))
         log(
@@ -279,32 +305,51 @@ def main(argv: list[str] | None = None) -> int:
     for i, j in pairs:
         name = pair_name(i, j)
         existing = records.get(name)
-        if existing and "shift_magnitude" in existing:
+        needs_shift = existing is None or "shift_magnitude" not in existing
+        needs_time = bool(args.fps) and existing is not None and "speed_px_s" not in existing
+        if not needs_shift and not needs_time:
             continue
-        cached = flow_dir / f"{name}.npy"
-        record = None
-        if cached.exists():  # backfill stats from an already saved field
+        record = dict(existing) if existing is not None else None
+        if record is None:  # no sidecar: rebuild from the saved field, if any
+            cached = flow_dir / f"{name}.npy"
+            if not cached.exists():
+                continue
             record = {
                 "pair": name,
                 "from": paths[i - 1].name,
                 "to": paths[j - 1].name,
                 **flow_stats(load_flow(cached)),
             }
-        if existing:
-            # stats predate global_shift — the shift needs only the frames
-            record = dict(existing)
-        if record is not None:
-            if "shift_magnitude" not in record:
-                record.update(
-                    global_shift(
-                        load_gray(paths[i - 1], cfg.scale),
-                        load_gray(paths[j - 1], cfg.scale),
-                    )
+        if "shift_magnitude" not in record:  # needs only the frames
+            record.update(
+                global_shift(
+                    load_gray(paths[i - 1], cfg.scale),
+                    load_gray(paths[j - 1], cfg.scale),
                 )
-            records[name] = record
-            stats_dir.mkdir(parents=True, exist_ok=True)
-            (stats_dir / f"{name}.json").write_text(json.dumps(record, indent=2))
+            )
+        records[name] = with_timing(record, i, j, args.fps)
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        (stats_dir / f"{name}.json").write_text(json.dumps(records[name], indent=2))
     rows = [records[k] for k in sorted(records)]
+
+    if not args.no_frame_quality and not args.dry_run:
+        quality_csv = out_dir / "frame_quality.csv"
+        with quality_csv.open("w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["frame", "index", "t_s", "brightness", "contrast", "sharpness"])
+            for idx, path in enumerate(paths, start=1):
+                q = frame_quality(path)
+                writer.writerow(
+                    [
+                        path.name,
+                        idx,
+                        f"{(idx - 1) / args.fps:.3f}" if args.fps else "",
+                        f"{q['brightness']:.2f}",
+                        f"{q['contrast']:.2f}",
+                        f"{q['sharpness']:.2f}",
+                    ]
+                )
+        log(f"quality     : {quality_csv}")
 
     if rows:
         report_csv = out_dir / "report.csv"

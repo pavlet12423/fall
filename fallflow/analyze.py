@@ -22,17 +22,67 @@ SERIES = (
     ("direction_coherence", "direction coherence", (0, 100, 220)),
     ("shift_magnitude", "global shift, px", (180, 0, 0)),
     ("mean_dy", "mean dy, px (down +)", (200, 0, 160)),
+    ("speed_px_s", "flow speed, px/s", (0, 150, 150)),
+    ("shift_speed_px_s", "global shift speed, px/s", (150, 0, 110)),
+    ("sharpness", "sharpness (Laplacian var)", (90, 90, 90)),
+    ("brightness", "brightness", (120, 90, 40)),
 )
+
+
+def load_frame_quality(out_dir: str | Path) -> dict[str, dict]:
+    """frame filename -> {brightness, contrast, sharpness}."""
+    path = Path(out_dir) / "frame_quality.csv"
+    if not path.exists():
+        return {}
+    with path.open() as fh:
+        return {
+            row["frame"]: {
+                "brightness": float(row["brightness"]),
+                "contrast": float(row["contrast"]),
+                "sharpness": float(row["sharpness"]),
+            }
+            for row in csv.DictReader(fh)
+        }
+
+
+def _shift_key(records: list[dict]) -> str:
+    return "shift_speed_px_s" if "shift_speed_px_s" in records[0] else "shift_magnitude"
+
+
+# when the frame rate is known the px/s series replace their px counterparts
+REDUNDANT_WITH_TIME = {
+    "mean_magnitude": "speed_px_s",
+    "shift_magnitude": "shift_speed_px_s",
+}
+
+
+def series_for(records: list[dict]) -> tuple:
+    """SERIES entries available in these records, without px/px-s duplicates."""
+    available = {name for name, _, _ in SERIES if name in records[0]}
+    out = []
+    for name, label, color in SERIES:
+        if name not in available:
+            continue
+        if REDUNDANT_WITH_TIME.get(name) in available:
+            continue
+        out.append((name, label, color))
+    return tuple(out)
+
 
 # heuristics tuned for "a person falls": motion gets faster, more coherent
 # and more vertical than the surrounding background motion
-FEATURES = (
-    ("mean_magnitude", 1.0),  # faster than usual
-    ("direction_coherence", 1.0),  # motion lines up in one direction
-    ("verticality", 1.0),  # vertical component dominates
-    ("moving_pixels_pct", 0.5),  # more of the frame is moving
-    ("shift_magnitude", 1.5),  # whole-frame displacement jumps
-)
+def features_for(records: list[dict]) -> tuple:
+    """Feature set for the event score, adapted to the available columns."""
+    available = {name for name, _, _ in SERIES if name in records[0]}
+    speed = "speed_px_s" if "speed_px_s" in available else "mean_magnitude"
+    shift = _shift_key(records)
+    return (
+        (speed, 1.0),  # faster than usual
+        ("direction_coherence", 1.0),  # motion lines up in one direction
+        ("verticality", 1.0),  # vertical component dominates
+        ("moving_pixels_pct", 0.5),  # more of the frame is moving
+        (shift, 1.5),  # whole-frame displacement jumps
+    )
 
 
 def load_records(out_dir: str | Path) -> list[dict]:
@@ -88,26 +138,59 @@ def verticality(record: dict) -> float:
 
 
 def analyse(
-    records: list[dict], window: int = 15, min_magnitude: float = 0.1
+    records: list[dict],
+    window: int = 15,
+    min_magnitude: float = 0.1,
+    min_response: float = 0.2,
+    min_sharpness: float = 0.0,
+    quality: dict[str, dict] | None = None,
 ) -> list[dict]:
     """`min_magnitude` filters out (near-)static pairs: with no motion the
-    direction and coherence are pure noise and must not seed the baseline."""
+    direction and coherence are pure noise and must not seed the baseline.
+    `min_response` / `min_sharpness` mark measurements the estimators could
+    not make reliably; those are excluded from the baseline and the score."""
     """Enrich records with z-scores and a combined event score."""
     if not records:
         return []
+    if quality:
+        for record in records:
+            q = quality.get(record.get("to", ""), {})
+            record.update(q)
+
     values = {
         name: np.array([r.get(name, 0.0) for r in records]) for name, _, _ in SERIES
     }
     vert = np.array([verticality(r) for r in records])
-    zs = {name: robust_z(v, window) for name, v in values.items()}
+    shift_key = _shift_key(records)
+    trustworthy = np.array(
+        [
+            r.get("shift_response", 1.0) >= min_response
+            and r.get("sharpness", 1e9) >= min_sharpness
+            for r in records
+        ]
+    )
+    zs = {}
+    for name, v in values.items():
+        if name in ("shift_magnitude", "shift_speed_px_s"):
+            # baseline from the trustworthy samples only, so a failed estimate
+            # cannot inflate it and cannot score as an event either
+            z = np.zeros(len(v))
+            if trustworthy.sum() >= 3:
+                z[trustworthy] = robust_z(v[trustworthy], window)
+            else:
+                z = robust_z(v, window)
+            zs[name] = z
+        else:
+            zs[name] = robust_z(v, window)
     zs["verticality"] = robust_z(vert, window)
+    features = features_for(records)
 
     out = []
     for i, record in enumerate(records):
         static = bool(values["mean_magnitude"][i] < min_magnitude)
         score = 0.0
         if not static:
-            for name, weight in FEATURES:
+            for name, weight in features:
                 score += weight * max(0.0, float(zs[name][i]))  # only positive spikes
         enriched = dict(record)
         if static:  # keep the numbers, but they carry no signal
@@ -124,6 +207,7 @@ def analyse(
                 "event_score": float(score),
                 "is_event": bool(not static and score >= 6.0),
                 "static": static,
+                "low_quality": bool(not trustworthy[i]),
             }
         )
         out.append(enriched)
@@ -143,12 +227,17 @@ def write_csv(path: str | Path, records: list[dict]) -> Path:
         "shift_magnitude", "shift_x", "shift_y", "shift_response",
         "z_mean_magnitude", "z_moving_pixels_pct", "z_direction_coherence",
         "z_verticality", "z_shift_magnitude", "event_score", "is_event", "static",
+        "sharpness", "brightness", "contrast", "low_quality",
     ]
     with path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
     return path
+
+
+def _xlabel(record: dict) -> str:
+    return f"{record['t_from']:.1f}s" if "t_from" in record else record["pair"][-4:]
 
 
 def _panel(
@@ -190,7 +279,7 @@ def _panel(
     )
 
 
-def plot(records: list[dict], path: str | Path, title: str = "") -> Path:
+def plot(records: list[dict], path: str | Path, title: str = "") -> Path:  # noqa: C901
     """Stacked chart of every series with anomalies marked in red."""
     if not records:
         raise ValueError("nothing to plot")
@@ -199,7 +288,7 @@ def plot(records: list[dict], path: str | Path, title: str = "") -> Path:
 
     left, right, top, bottom = 70, 30, 46, 34
     panel_h, gap = 150, 26
-    panels = len(SERIES)
+    panels = len(series_for(records))
     width = 1400
     plot_w = width - left - right
     height = top + panels * (panel_h + gap) + bottom
@@ -217,9 +306,9 @@ def plot(records: list[dict], path: str | Path, title: str = "") -> Path:
         cv2.LINE_AA,
     )
 
-    for panel, (name, label, color) in enumerate(SERIES):
+    for panel, (name, label, color) in enumerate(series_for(records)):
         values = np.array([r[name] for r in records], dtype=np.float64)
-        z = np.array([r[f"z_{name}"] if f"z_{name}" in r else 0.0 for r in records])
+        z = np.array([r.get(f"z_{name}", 0.0) for r in records])
         _panel(
             canvas,
             top + panel * (panel_h + gap),
@@ -237,7 +326,7 @@ def plot(records: list[dict], path: str | Path, title: str = "") -> Path:
         x = int(left + k * (plot_w / max(1, len(records) - 1)))
         cv2.putText(
             canvas,
-            records[k]["pair"][-4:],
+            _xlabel(records[k]),
             (x - 14, height - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.36,
@@ -260,6 +349,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold", type=float, default=6.0, help="event score cutoff")
     p.add_argument("--top", type=int, default=10, help="how many events to print")
     p.add_argument(
+        "--min-response",
+        type=float,
+        default=0.2,
+        help="phase-correlation response below this = unreliable shift",
+    )
+    p.add_argument(
+        "--min-sharpness",
+        type=float,
+        default=0.0,
+        help="frames with Laplacian variance below this = too blurry to trust",
+    )
+    p.add_argument(
         "--min-magnitude",
         type=float,
         default=0.1,
@@ -272,7 +373,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     out_dir = Path(args.out)
-    records = analyse(load_records(out_dir), args.window, args.min_magnitude)
+    records = analyse(
+        load_records(out_dir),
+        args.window,
+        args.min_magnitude,
+        args.min_response,
+        args.min_sharpness,
+        load_frame_quality(out_dir),
+    )
     if not records:
         print(f"no stats found in {out_dir} — run `python -m fallflow` first", )
         return 1
@@ -285,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"events   : {sum(r['is_event'] for r in records)} (score >= {args.threshold})")
     print(f"static   : {sum(r.get('static', False) for r in records)} pair(s) below "
           f"{args.min_magnitude} px (excluded)")
+    print(f"untrusted: {sum(r.get('low_quality', False) for r in records)} pair(s) with "
+          f"weak correlation or blur (excluded from the score)")
 
     print("\ntop anomalies by event score:")
     print(f"  {'pair':>9s} {'score':>6s} {'|v|':>6s} {'mov%':>5s} {'coh':>5s} {'vert':>5s} {'z|v|':>5s} {'zcoh':>5s}")
