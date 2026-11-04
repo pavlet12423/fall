@@ -15,6 +15,57 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+## Запуск `probe.py` у себя на компьютере (Windows / macOS / Linux)
+
+Нужен только Python и две библиотеки. Всё считается локально, в интернет ничего не уходит.
+
+**1. Python.** Если его нет — https://www.python.org/downloads/ , версия 3.10 или новее.
+На Windows в установщике обязательно поставьте галочку **«Add python.exe to PATH»**.
+Проверка (в терминале / PowerShell / cmd):
+
+```
+python --version
+```
+
+**2. Получить файлы.** Вариант А — целиком:
+
+```
+git clone https://github.com/pavlet12423/fall.git
+cd fall
+git checkout arena/3b8d899a-fall
+```
+
+Вариант Б — без Git: на странице репозитория **Code → Download ZIP**, распаковать.
+(Папка `data/frames` весит ~107 МБ, она нужна — это сами кадры.)
+
+Минимум, что должно быть рядом: `probe.py` и `data/frames/*.png`.
+
+**3. Поставить библиотеки** (один раз):
+
+```
+python -m venv .venv
+.venv\Scripts\pip install numpy opencv-python-headless      ← Windows
+.venv/bin/pip install numpy opencv-python-headless          ← macOS / Linux
+```
+
+или без виртуального окружения, просто:
+
+```
+pip install numpy opencv-python-headless
+```
+
+**4. Запустить:**
+
+```
+.venv\Scripts\python probe.py --frames data/frames --fps 25    ← Windows
+.venv/bin/python probe.py --frames data/frames --fps 25        ← macOS / Linux
+```
+
+Появится строка `откройте http://127.0.0.1:8765` — откройте этот адрес в браузере.
+Загрузка 120 кадров занимает ~30 секунд. Остановить — Ctrl+C в терминале.
+
+Если порт занят: `python probe.py --frames data/frames --fps 25 --port 8766`.
+
 ## Запуск
 
 ```bash
