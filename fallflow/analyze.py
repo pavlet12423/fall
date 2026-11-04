@@ -121,7 +121,11 @@ def robust_z(values: np.ndarray, window: int = 15, min_scale_frac: float = 0.5) 
     )
     local = 1.4826 * mad
     global_scale = 1.4826 * float(np.median(np.abs(values - np.median(values))))
-    scale = np.maximum(local, min_scale_frac * max(global_scale, 1e-6))
+    # absolute floor: a series that is essentially flat (or essentially zero)
+    # must not turn a rounding error into a z of hundreds
+    level = float(np.median(np.abs(values))) or 1.0
+    floor = max(min_scale_frac * global_scale, 0.02 * level, 1e-6)
+    scale = np.maximum(local, floor)
     return (values - baseline) / scale
 
 

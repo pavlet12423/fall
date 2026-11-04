@@ -50,25 +50,86 @@ def cell_features(flow: np.ndarray, cols: int = 8, rows: int = 5) -> dict:
     return {"magnitude": mag, "dx": dx, "dy": dy, "coherence": coh}
 
 
+def camera_vector(
+    flow: np.ndarray, mode: str = "median"
+) -> np.ndarray:
+    """Estimate the whole-frame (camera) motion to subtract.
+
+    ``median`` takes the per-axis median of the flow field: a moving object
+    usually covers well under half the frame, so the median tracks the camera
+    and ignores the object. Unlike phase correlation it never fails to return
+    a number, which matters on blurry frames.
+    """
+    flat = flow.reshape(-1, 2)
+    if mode == "median":
+        return np.median(flat, axis=0).astype(np.float32)
+    if mode == "mean":
+        return flat.mean(axis=0).astype(np.float32)
+    return np.zeros(2, np.float32)
+
+
+def load_shifts(out_dir: str | Path) -> dict[str, tuple[float, float, float]]:
+    """pair -> (shift_x, shift_y, response) from report.json, if present."""
+    report = Path(out_dir) / "report.json"
+    if not report.exists():
+        return {}
+    return {
+        r["pair"]: (
+            float(r.get("shift_x", 0.0)),
+            float(r.get("shift_y", 0.0)),
+            float(r.get("shift_response", 0.0)),
+        )
+        for r in json.loads(report.read_text())
+    }
+
+
 def collect(
-    flow_dir: str | Path, cols: int = 8, rows: int = 5
-) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Stack per-cell magnitudes and coherences of every saved flow field."""
+    flow_dir: str | Path,
+    cols: int = 8,
+    rows: int = 5,
+    compensate: str = "none",
+    shifts: dict[str, tuple[float, float, float]] | None = None,
+    min_response: float = 0.2,
+) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+    """Stack per-cell magnitudes/coherences, optionally with camera motion removed.
+
+    ``compensate`` is one of none | median | mean | shift. With ``shift`` the
+    phase-correlation estimate is used where it is trustworthy
+    (response >= min_response) and the median of the flow elsewhere.
+    """
     files = sorted(Path(flow_dir).glob("flow_*.npy"))
     if not files:
         raise FileNotFoundError(f"no flow_*.npy in {flow_dir}")
-    mags, cohs = [], []
-    names = []
+    mags, cohs, names, cameras = [], [], [], []
     for path in files:
-        cf = cell_features(load_flow(path), cols, rows)
+        flow = load_flow(path)
+        name = path.stem
+        if compensate == "shift":
+            sx, sy, response = (shifts or {}).get(name, (0.0, 0.0, 0.0))
+            camera = (
+                np.array([sx, sy], np.float32)
+                if response >= min_response
+                else camera_vector(flow, "median")
+            )
+        elif compensate in ("median", "mean"):
+            camera = camera_vector(flow, compensate)
+        else:
+            camera = np.zeros(2, np.float32)
+        cameras.append(camera)
+        flow = flow - camera
+        cf = cell_features(flow, cols, rows)
         mags.append(cf["magnitude"])
         cohs.append(cf["coherence"])
-        names.append(path.stem)
-    return names, np.stack(mags), np.stack(cohs)
+        names.append(name)
+    return names, np.stack(mags), np.stack(cohs), np.stack(cameras)
 
 
 def analyse(
-    names: list[str], mags: np.ndarray, cohs: np.ndarray, window: int = 15
+    names: list[str],
+    mags: np.ndarray,
+    cohs: np.ndarray,
+    window: int = 15,
+    cameras: np.ndarray | None = None,
 ) -> list[dict]:
     """Per-cell z-scores over time -> local spike, its position, concentration."""
     n, rows, cols = mags.shape
@@ -82,12 +143,18 @@ def analyse(
         grid = mags[i]
         frame_mean = float(grid.mean())
         peak = float(grid.max())
-        # how much the hottest cell stands out from a typical cell
-        concentration = peak / (float(np.median(grid)) or 1e-9)
+        # peak-to-mean: how much the hottest cell stands out. Bounded by the
+        # number of cells and well behaved when most cells are near zero
+        # (a peak/median ratio explodes there).
+        concentration = float(peak / (frame_mean + 1e-6))
         r, c = np.unravel_index(np.argmax(z[i]), z[i].shape)
+        camera = cameras[i] if cameras is not None else np.zeros(2)
         records.append(
             {
                 "pair": name,
+                "camera_dx": float(camera[0]),
+                "camera_dy": float(camera[1]),
+                "camera_speed": float(np.hypot(camera[0], camera[1])),
                 "frame_mean_magnitude": frame_mean,
                 "peak_cell_magnitude": peak,
                 "concentration": float(concentration),
@@ -197,6 +264,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=15, help="rolling baseline window")
     p.add_argument("--threshold", type=float, default=8.0, help="local_score cutoff")
     p.add_argument("--top", type=int, default=8, help="how many pairs to print")
+    p.add_argument(
+        "--compensate",
+        choices=["none", "median", "mean", "shift"],
+        default="none",
+        help="subtract the whole-frame (camera) motion before the cell stats",
+    )
     p.add_argument("--heatmaps", type=int, default=6, help="heatmaps to render (0 = none)")
     return p
 
@@ -207,8 +280,17 @@ def main(argv: list[str] | None = None) -> int:
     analysis = out_dir / "analysis"
     analysis.mkdir(parents=True, exist_ok=True)
 
-    names, mags, cohs = collect(out_dir / "flow", args.cols, args.rows)
-    records = analyse(names, mags, cohs, args.window)
+    names, mags, cohs, cameras = collect(
+        out_dir / "flow",
+        args.cols,
+        args.rows,
+        args.compensate,
+        load_shifts(out_dir),
+    )
+    records = analyse(names, mags, cohs, args.window, cameras)
+    suffix = f"_{args.compensate}" if args.compensate != "none" else ""
+    for name in ("regions.csv", "regions.json", "regions_chart.png"):
+        (analysis / name).unlink(missing_ok=True)
     for r in records:
         r["is_local_event"] = bool(r["local_score"] >= args.threshold)
 
@@ -216,17 +298,28 @@ def main(argv: list[str] | None = None) -> int:
         "pair", "frame_mean_magnitude", "peak_cell_magnitude", "concentration",
         "max_cell_z", "peak_row", "peak_col", "active_cells", "coherence_peak",
         "z_frame", "z_concentration", "local_score", "is_local_event",
+        "camera_dx", "camera_dy", "camera_speed",
     ]
-    csv_path = analysis / "regions.csv"
+    csv_path = analysis / f"regions{suffix}.csv"
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
-    (analysis / "regions.json").write_text(
-        json.dumps([{k: v for k, v in r.items() if k not in ("grid_mean", "grid_z")} for r in records], indent=2)
+    (analysis / f"regions{suffix}.json").write_text(
+        json.dumps(
+            [
+                {k: v for k, v in r.items() if k not in ("grid_mean", "grid_z")}
+                for r in records
+            ],
+            indent=2,
+        )
     )
 
     print(f"grid      : {args.rows}x{args.cols} ({args.rows * args.cols} cells per pair)")
+    if args.compensate != "none":
+        cam = np.linalg.norm(cameras, axis=1)
+        print(f"camera    : compensated with '{args.compensate}', "
+              f"median |camera| {np.median(cam):.2f} px (max {cam.max():.2f})")
     print(f"pairs     : {len(records)}")
     print(f"events    : {sum(r['is_local_event'] for r in records)} (local_score >= {args.threshold})")
     print()
@@ -245,10 +338,12 @@ def main(argv: list[str] | None = None) -> int:
         vmax = float(mags.max())
         for r in sorted(records, key=lambda x: -x["local_score"])[: args.heatmaps]:
             grid = np.array(r["grid_mean"])
-            cv2.imwrite(str(hm_dir / f"{r['pair']}.png"), heatmap(grid, vmax=vmax))
+            cv2.imwrite(
+                str(hm_dir / f"{r['pair']}{suffix}.png"), heatmap(grid, vmax=vmax)
+            )
         print(f"\nheatmaps  : {hm_dir} (top {args.heatmaps}, shared colour scale)")
 
-    chart = _chart(records, analysis / "regions_chart.png", args.threshold)
+    chart = _chart(records, analysis / f"regions_chart{suffix}.png", args.threshold)
     print(f"chart     : {chart}")
     print(f"regions   : {csv_path}")
     return 0
