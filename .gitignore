@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Pipeline outputs (flow fields, visualisations, reports) — regenerated on demand
+outputs/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
